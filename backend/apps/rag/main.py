@@ -690,15 +690,42 @@ def store_web(form_data: UrlForm, user=Depends(get_current_user)):
 
 
 def get_web_loader(url: Union[str, Sequence[str]], verify_ssl: bool = True):
-    # Check if the URL is valid
-    if not validate_url(url):
+    if isinstance(url, str):
+        url = [url]
+    valid_urls = [u for u in url if validate_single_url(u)]
+    if not valid_urls:
         raise ValueError(ERROR_MESSAGES.INVALID_URL)
     return WebBaseLoader(
-        url,
+        valid_urls,
         verify_ssl=verify_ssl,
         requests_per_second=RAG_WEB_SEARCH_CONCURRENT_REQUESTS,
         continue_on_failure=True,
     )
+
+
+def validate_single_url(url: str):
+    if isinstance(validators.url(url), validators.ValidationError):
+        raise ValueError(ERROR_MESSAGES.INVALID_URL)
+    if not ENABLE_RAG_LOCAL_WEB_FETCH:
+        # Local web fetch is disabled, filter out any URLs that resolve to private IP addresses
+        parsed_url = urllib.parse.urlparse(url)
+        # Get IPv4 and IPv6 addresses
+        try:
+            ipv4_addresses, ipv6_addresses = resolve_hostname(parsed_url.hostname)
+        except Exception as e:
+            log.warning(f"Failed to resolve hostname for URL {url}: {e}")
+            return False
+        if not ipv4_addresses and not ipv6_addresses:
+            return False
+        # Check if any of the resolved addresses are private
+        # This is technically still vulnerable to DNS rebinding attacks, as we don't control WebBaseLoader
+        for ip in ipv4_addresses:
+            if validators.ipv4(ip, private=True):
+                raise ValueError(ERROR_MESSAGES.INVALID_URL)
+        for ip in ipv6_addresses:
+            if validators.ipv6(ip, private=True):
+                raise ValueError(ERROR_MESSAGES.INVALID_URL)
+    return True
 
 
 def validate_url(url: Union[str, Sequence[str]]):
@@ -710,6 +737,8 @@ def validate_url(url: Union[str, Sequence[str]]):
             parsed_url = urllib.parse.urlparse(url)
             # Get IPv4 and IPv6 addresses
             ipv4_addresses, ipv6_addresses = resolve_hostname(parsed_url.hostname)
+            if not ipv4_addresses and not ipv6_addresses:
+                return False
             # Check if any of the resolved addresses are private
             # This is technically still vulnerable to DNS rebinding attacks, as we don't control WebBaseLoader
             for ip in ipv4_addresses:
@@ -727,13 +756,17 @@ def validate_url(url: Union[str, Sequence[str]]):
 
 def resolve_hostname(hostname):
     # Get address information
-    addr_info = socket.getaddrinfo(hostname, None)
+    try:
+        addr_info = socket.getaddrinfo(hostname, None)
 
-    # Extract IP addresses from address information
-    ipv4_addresses = [info[4][0] for info in addr_info if info[0] == socket.AF_INET]
-    ipv6_addresses = [info[4][0] for info in addr_info if info[0] == socket.AF_INET6]
+        # Extract IP addresses from address information
+        ipv4_addresses = [info[4][0] for info in addr_info if info[0] == socket.AF_INET]
+        ipv6_addresses = [info[4][0] for info in addr_info if info[0] == socket.AF_INET6]
 
-    return ipv4_addresses, ipv6_addresses
+        return ipv4_addresses, ipv6_addresses
+    except socket.gaierror:
+        # Return empty lists if the hostname cannot be resolved
+        return [], []
 
 
 def search_web(engine: str, query: str) -> list[SearchResult]:
@@ -1162,30 +1195,6 @@ def scan_docs_dir(user=Depends(get_admin_user)):
 @app.get("/reset/db")
 def reset_vector_db(user=Depends(get_admin_user)):
     CHROMA_CLIENT.reset()
-
-
-@app.get("/reset/uploads")
-def reset_upload_dir(user=Depends(get_admin_user)) -> bool:
-    folder = f"{UPLOAD_DIR}"
-    try:
-        # Check if the directory exists
-        if os.path.exists(folder):
-            # Iterate over all the files and directories in the specified directory
-            for filename in os.listdir(folder):
-                file_path = os.path.join(folder, filename)
-                try:
-                    if os.path.isfile(file_path) or os.path.islink(file_path):
-                        os.unlink(file_path)  # Remove the file or link
-                    elif os.path.isdir(file_path):
-                        shutil.rmtree(file_path)  # Remove the directory
-                except Exception as e:
-                    print(f"Failed to delete {file_path}. Reason: {e}")
-        else:
-            print(f"The directory {folder} does not exist")
-    except Exception as e:
-        print(f"Failed to process the directory {folder}. Reason: {e}")
-
-    return True
 
 
 @app.get("/reset")
